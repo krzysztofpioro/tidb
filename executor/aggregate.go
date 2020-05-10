@@ -1086,21 +1086,120 @@ func (e *vecGroupChecker) splitIntoGroups(chk *chunk.Chunk) (isFirstGroupSameAsP
 		e.sameGroup = append(e.sameGroup, true)
 	}
 
+	cols := make([]*chunk.Column, len(e.GroupByItems))
+	i := 0
 	for _, item := range e.GroupByItems {
-		err = e.evalGroupItemsAndResolveGroups(item, chk, numRows)
+		cols[i], err = e.evalGroupItems(item, chk, numRows)
 		if err != nil {
 			return false, err
 		}
+		defer e.releaseBuffer(cols[i])
+		i++
 	}
 
-	for i := 1; i < numRows; i++ {
-		if !e.sameGroup[i] {
-			e.groupOffset = append(e.groupOffset, i)
+	// resolve groups using exponential search
+	for i := 0; i < numRows; {
+		e.sameGroup[i] = false
+		j := 1
+		for ; i+j < numRows; j = j * 2 {
+			equal, err := e.equalRows(cols, i, i+j)
+			if err != nil {
+				return false, err
+			}
+			if !equal {
+				break
+			}
+			i = i + j
 		}
+		j = j / 2
+		for ; j >= 1; j = j / 2 {
+			if i+j < numRows {
+				equal, err := e.equalRows(cols, i, i+j)
+				if err != nil {
+					return false, err
+				}
+				if equal {
+					i = i + j
+				}
+			}
+		}
+		i++
+		e.groupOffset = append(e.groupOffset, i)
 	}
-	e.groupOffset = append(e.groupOffset, numRows)
+
 	e.groupCount = len(e.groupOffset)
 	return isFirstGroupSameAsPrev, nil
+}
+
+func (e *vecGroupChecker) equalRows(cols []*chunk.Column, row1 int, row2 int) (equal bool, err error) {
+	i := 0
+	for _, item := range e.GroupByItems {
+		equal, err := e.equalRowsByItem(cols[i], row1, row2, item)
+		if err != nil {
+			return false, err
+		}
+		if !equal {
+			return false, nil
+		}
+		i++
+	}
+	return true, nil
+}
+
+func (e *vecGroupChecker) equalRowsByItem(col *chunk.Column, row1 int, row2 int, item expression.Expression) (equal bool, err error) {
+	tp := item.GetType()
+	eType := tp.EvalType()
+	isNull1 := col.IsNull(row1)
+	isNull2 := col.IsNull(row2)
+	if isNull1 != isNull2 {
+		return false, nil
+	}
+	if isNull1 && isNull2 {
+		return true, nil
+	}
+	switch eType {
+	case types.ETInt:
+		val1, val2 := col.GetInt64(row1), col.GetInt64(row2)
+		if val1 == val2 {
+			return true, nil
+		}
+	case types.ETReal:
+		val1, val2 := col.GetFloat64(row1), col.GetFloat64(row2)
+		if val1 == val2 {
+			return true, nil
+		}
+	case types.ETDecimal:
+		val1, val2 := col.GetDecimal(row1), col.GetDecimal(row2)
+		if val1.Compare(val2) == 0 {
+			return true, nil
+		}
+	case types.ETDatetime, types.ETTimestamp:
+		val1, val2 := col.GetTime(row1), col.GetTime(row2)
+		if val1.Compare(val2) == 0 {
+			return true, nil
+		}
+	case types.ETDuration:
+		val1 := col.GetDuration(row1, item.GetType().Decimal)
+		val2 := col.GetDuration(row2, item.GetType().Decimal)
+		if val1 == val2 {
+			return true, nil
+		}
+	case types.ETJson:
+		val1, val2 := col.GetJSON(row1), col.GetJSON(row2)
+		if json.CompareBinary(val1, val2) == 0 {
+			return true, nil
+		}
+	case types.ETString:
+		val1 := codec.ConvertByCollationStr(col.GetString(row1), tp)
+		val2 := codec.ConvertByCollationStr(col.GetString(row2), tp)
+		if val1 == val2 {
+			return true, nil
+		}
+	default:
+		err = errors.New(fmt.Sprintf("invalid eval type %v", eType))
+		return false, err
+	}
+	return false, nil
 }
 
 func (e *vecGroupChecker) getFirstAndLastRowDatum(item expression.Expression, chk *chunk.Chunk, numRows int) (err error) {
@@ -1269,9 +1368,8 @@ func (e *vecGroupChecker) getFirstAndLastRowDatum(item expression.Expression, ch
 	return err
 }
 
-// evalGroupItemsAndResolveGroups evaluates the chunk according to the expression item.
-// And resolve the rows into groups according to the evaluation results
-func (e *vecGroupChecker) evalGroupItemsAndResolveGroups(item expression.Expression, chk *chunk.Chunk, numRows int) (err error) {
+// evalGroupItems evaluates the chunk according to the expression item
+func (e *vecGroupChecker) evalGroupItems(item expression.Expression, chk *chunk.Chunk, numRows int) (col *chunk.Column, err error) {
 	tp := item.GetType()
 	eType := tp.EvalType()
 	if e.allocateBuffer == nil {
@@ -1280,133 +1378,15 @@ func (e *vecGroupChecker) evalGroupItemsAndResolveGroups(item expression.Express
 	if e.releaseBuffer == nil {
 		e.releaseBuffer = expression.PutColumn
 	}
-	col, err := e.allocateBuffer(eType, numRows)
+	col, err = e.allocateBuffer(eType, numRows)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer e.releaseBuffer(col)
 	err = expression.EvalExpr(e.ctx, item, chk, col)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	previousIsNull := col.IsNull(0)
-	switch eType {
-	case types.ETInt:
-		vals := col.Int64s()
-		for i := 1; i < numRows; i++ {
-			isNull := col.IsNull(i)
-			switch e.sameGroup[i] {
-			case !previousIsNull && !isNull:
-				if vals[i] != vals[i-1] {
-					e.sameGroup[i] = false
-				}
-			case isNull != previousIsNull:
-				e.sameGroup[i] = false
-			}
-			previousIsNull = isNull
-		}
-	case types.ETReal:
-		vals := col.Float64s()
-		for i := 1; i < numRows; i++ {
-			isNull := col.IsNull(i)
-			switch e.sameGroup[i] {
-			case !previousIsNull && !isNull:
-				if vals[i] != vals[i-1] {
-					e.sameGroup[i] = false
-				}
-			case isNull != previousIsNull:
-				e.sameGroup[i] = false
-			}
-			previousIsNull = isNull
-		}
-	case types.ETDecimal:
-		vals := col.Decimals()
-		for i := 1; i < numRows; i++ {
-			isNull := col.IsNull(i)
-			switch e.sameGroup[i] {
-			case !previousIsNull && !isNull:
-				if vals[i].Compare(&vals[i-1]) != 0 {
-					e.sameGroup[i] = false
-				}
-			case isNull != previousIsNull:
-				e.sameGroup[i] = false
-			}
-			previousIsNull = isNull
-		}
-	case types.ETDatetime, types.ETTimestamp:
-		vals := col.Times()
-		for i := 1; i < numRows; i++ {
-			isNull := col.IsNull(i)
-			switch e.sameGroup[i] {
-			case !previousIsNull && !isNull:
-				if vals[i].Compare(vals[i-1]) != 0 {
-					e.sameGroup[i] = false
-				}
-			case isNull != previousIsNull:
-				e.sameGroup[i] = false
-			}
-			previousIsNull = isNull
-		}
-	case types.ETDuration:
-		vals := col.GoDurations()
-		for i := 1; i < numRows; i++ {
-			isNull := col.IsNull(i)
-			switch e.sameGroup[i] {
-			case !previousIsNull && !isNull:
-				if vals[i] != vals[i-1] {
-					e.sameGroup[i] = false
-				}
-			case isNull != previousIsNull:
-				e.sameGroup[i] = false
-			}
-			previousIsNull = isNull
-		}
-	case types.ETJson:
-		var previousKey, key json.BinaryJSON
-		if !previousIsNull {
-			previousKey = col.GetJSON(0)
-		}
-		for i := 1; i < numRows; i++ {
-			isNull := col.IsNull(i)
-			if !isNull {
-				key = col.GetJSON(i)
-			}
-			if e.sameGroup[i] {
-				if isNull == previousIsNull {
-					if !isNull && json.CompareBinary(previousKey, key) != 0 {
-						e.sameGroup[i] = false
-					}
-				} else {
-					e.sameGroup[i] = false
-				}
-			}
-			if !isNull {
-				previousKey = key
-			}
-			previousIsNull = isNull
-		}
-	case types.ETString:
-		previousKey := codec.ConvertByCollationStr(col.GetString(0), tp)
-		for i := 1; i < numRows; i++ {
-			key := codec.ConvertByCollationStr(col.GetString(i), tp)
-			isNull := col.IsNull(i)
-			if e.sameGroup[i] {
-				if isNull != previousIsNull || previousKey != key {
-					e.sameGroup[i] = false
-				}
-			}
-			previousKey = key
-			previousIsNull = isNull
-		}
-	default:
-		err = errors.New(fmt.Sprintf("invalid eval type %v", eType))
-	}
-	if err != nil {
-		return err
-	}
-
-	return err
+	return col, err
 }
 
 func (e *vecGroupChecker) getNextGroup() (begin, end int) {
